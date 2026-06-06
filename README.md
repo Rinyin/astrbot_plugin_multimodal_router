@@ -21,3 +21,7 @@
 ```
 
 列出当前加载的 LLM providers，并标记当前使用项。
+
+## License
+
+AGPL-3.0
