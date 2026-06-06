@@ -1,0 +1,22 @@
+{
+  "target_provider_id": {
+    "description": "目标多模态 LLM provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "填写 AstrBot 已加载的多模态 provider ID。可用 /mmproviders 查看当前加载的 provider。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "confirm_turns": {
+    "description": "切换后追加确认提示的 LLM 请求轮数",
+    "type": "int",
+    "hint": "必须大于等于 1。插件会在这些后续请求的 system_prompt 中提醒模型回复前确认是否仍需多模态能力。",
+    "default": 3
+  },
+  "vision_provider_ids": {
+    "description": "已知具备多模态能力的 provider ID 白名单",
+    "type": "list",
+    "hint": "当 AstrBot provider 元数据没有明确能力字段时，用此列表兜底判断当前 provider 是否已支持图片。",
+    "default": []
+  }
+}
