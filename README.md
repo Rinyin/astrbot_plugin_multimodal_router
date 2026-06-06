@@ -1,4 +1,6 @@
-# AstrBot Multimodal Router
+# 多模态临时路由
+
+AstrBot Multimodal Router
 
 当用户消息包含图片，且当前 LLM provider 不具备多模态能力时，本插件尝试仅将本次 LLM 请求路由到配置的多模态 provider。
 
