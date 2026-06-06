@@ -1,6 +1,6 @@
 name: astrbot_plugin_multimodal_router
 desc: 当图片请求遇到非多模态 LLM 时，临时路由到指定多模态 provider。
-version: v1.0.0
+version: v1.1.0
 author: Rinyi
 license: AGPL-3.0
-repo: ""
+repo: "https://github.com/Rinyin/astrbot_plugin_multimodal_router"

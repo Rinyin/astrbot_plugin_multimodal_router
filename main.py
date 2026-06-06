@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 
 
@@ -17,12 +18,19 @@ CONFIRM_PROMPT = """
 不足以处理，请明确提醒需要切换到多模态模型。不要向用户暴露插件实现细节。
 """.strip()
 
+IMAGE_DESCRIPTION_SYSTEM_PROMPT = """
+你负责为对话上下文生成图片语义描述。请结合已有对话上下文、用户本轮文本
+和图片内容，输出一段给后续语言模型阅读的中文描述。要求：只描述图片中
+与当前对话可能相关的事实、文字、对象、场景、关系和关键信息；不要回答
+用户的问题；不要编造看不见的细节；不要输出标题或解释。
+""".strip()
+
 
 @register(
     "multimodal_router",
     "Rinyi",
     "当图片请求遇到非多模态 LLM 时，临时路由到指定多模态 provider。",
-    "1.0.0",
+    "1.1.0",
 )
 class MultimodalRouterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -73,6 +81,44 @@ class MultimodalRouterPlugin(Star):
         except Exception as exc:
             logger.error(f"{PLUGIN_NAME}: on_llm_request failed: {exc}", exc_info=True)
 
+    @filter.on_llm_response(priority=100)
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        """Add a hidden image description to saved contexts after routed replies."""
+        try:
+            if not self._should_describe_image(event, resp):
+                return
+
+            req = event.get_extra("provider_request")
+            if not isinstance(req, ProviderRequest) or not req.image_urls:
+                return
+
+            target_id = str(event.get_extra("mm_router_target_provider_id") or "")
+            provider = self.context.get_provider_by_id(target_id) if target_id else None
+            if provider is None:
+                logger.warning(
+                    f"{PLUGIN_NAME}: routed provider {target_id!r} not found; "
+                    "skip image context description."
+                )
+                return
+
+            description = await self._describe_images(provider, req)
+            if not description:
+                return
+
+            req.contexts.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[由多模态模型生成的图片上下文描述，供后续对话参考]\n"
+                        f"{description}"
+                    ),
+                }
+            )
+            event.set_extra("mm_router_description_done", True)
+            logger.info(f"{PLUGIN_NAME}: added routed image description to contexts.")
+        except Exception as exc:
+            logger.error(f"{PLUGIN_NAME}: on_llm_response failed: {exc}", exc_info=True)
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def prepare_provider_selection(self, event: AstrMessageEvent):
         """Select the multimodal provider before AstrBot builds the LLM request."""
@@ -106,6 +152,8 @@ class MultimodalRouterPlugin(Star):
                 return
 
             event.set_extra("selected_provider", target_id)
+            event.set_extra("mm_router_routed", True)
+            event.set_extra("mm_router_target_provider_id", target_id)
             self._confirm_remaining[self._session_key(event)] = self._confirm_turns()
             logger.info(
                 f"{PLUGIN_NAME}: selected provider {target_id!r} for one image request."
@@ -139,6 +187,55 @@ class MultimodalRouterPlugin(Star):
         if isinstance(raw_value, list):
             return {str(item).strip() for item in raw_value if str(item).strip()}
         return set()
+
+    def _should_describe_image(
+        self, event: AstrMessageEvent, resp: LLMResponse
+    ) -> bool:
+        return bool(
+            event.get_extra("mm_router_routed")
+            and not event.get_extra("mm_router_description_done")
+            and resp
+            and resp.role == "assistant"
+            and self._message_has_image(event)
+        )
+
+    async def _describe_images(self, provider: Any, req: ProviderRequest) -> str:
+        user_text = req.prompt.strip() if req.prompt else "[图片]"
+        prompt = (
+            "请为本轮用户图片生成一段上下文描述。\n\n"
+            f"用户本轮文本：{user_text}\n\n"
+            "输出限制：120-300 字；只输出描述正文。"
+        )
+        response = await self._call_compat(
+            provider.text_chat,
+            {
+                "prompt": prompt,
+                "session_id": req.session_id,
+                "image_urls": list(req.image_urls or []),
+                "contexts": list(req.contexts or []),
+                "system_prompt": IMAGE_DESCRIPTION_SYSTEM_PROMPT,
+                "model": getattr(req, "model", None),
+            },
+        )
+        description = str(getattr(response, "completion_text", "") or "").strip()
+        return description[:1200]
+
+    async def _call_compat(self, func: Any, kwargs: dict[str, Any]) -> Any:
+        signature = inspect.signature(func)
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+        if accepts_kwargs:
+            result = func(**kwargs)
+        else:
+            supported = {
+                key: value for key, value in kwargs.items() if key in signature.parameters
+            }
+            result = func(**supported)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     def _message_has_image(self, event: AstrMessageEvent) -> bool:
         message_obj = getattr(event, "message_obj", None)
