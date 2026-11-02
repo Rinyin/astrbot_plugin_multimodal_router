@@ -28,7 +28,7 @@ IMAGE_DESCRIPTION_SYSTEM_PROMPT = """
 
 @register(
     "multimodal_router",
-    "Rinyi",
+    "Rinyin",
     "当图片请求遇到非多模态 LLM 时，临时路由到指定多模态 provider。",
     "1.1.0",
 )
