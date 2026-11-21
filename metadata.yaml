@@ -1,6 +1,7 @@
-name: 多模态临时路由
-desc: 当图片请求遇到非多模态 LLM 时，临时路由到指定多模态 provider。
-version: v1.1.0
+name: astrbot_plugin_multimodal_router
+display_name: 多模态临时路由
+desc: 当图片请求遇到非多模态 LLM 时，临时路由到指定多模态模型回答，并可指定独立轻量视觉模型生成隐藏图片摘要写入上下文。
+version: v2.0.0
 author: Rinyin
 license: AGPL-3.0
 repo: "https://github.com/Rinyin/astrbot_plugin_multimodal_router"

@@ -1,22 +1,72 @@
 {
+  "enabled": {
+    "description": "启用多模态临时路由",
+    "type": "bool",
+    "hint": "关闭后插件不会拦截或路由任何图片请求。",
+    "default": true
+  },
   "target_provider_id": {
-    "description": "目标多模态 LLM provider ID",
+    "description": "临时回答多模态模型",
     "type": "string",
     "_special": "select_provider",
-    "hint": "填写 AstrBot 已加载的多模态 provider ID。可用 /mmproviders 查看当前加载的 provider。",
+    "hint": "当消息包含图片且当前会话模型不支持视觉时，临时路由至此多模态模型直接看图回答（例如 Opus 5）。可用 /mmproviders 查看已加载的 provider。",
     "obvious_hint": true,
     "default": ""
   },
-  "confirm_turns": {
-    "description": "切换后追加确认提示的 LLM 请求轮数",
+  "summary_provider_id": {
+    "description": "图片总结模型（隐藏上下文转述）",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "用于生成写入对话历史的隐藏图片摘要，建议选择低成本轻量视觉模型（如 Kimi / Flash）；留空则回退使用“临时回答多模态模型”。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "enable_image_summary": {
+    "description": "启用隐藏图片上下文摘要",
+    "type": "bool",
+    "hint": "开启后，会在路由回答完成后将图片摘要写入当前回合历史，供后续切回纯文本模型时参考。",
+    "default": true
+  },
+  "parallel_image_summary": {
+    "description": "独立总结模型并行生成摘要",
+    "type": "bool",
+    "hint": "当“图片总结模型”与“临时回答多模态模型”不同时，与回答模型并行生成图片摘要以降低总耗时；两者相同时自动串行以避免触发并发限流。",
+    "default": true
+  },
+  "summary_system_prompt": {
+    "description": "图片总结模型系统提示词",
+    "type": "text",
+    "hint": "指导图片总结模型生成供后续纯文本模型阅读的图片摘要。",
+    "default": "你负责为对话历史生成图片上下文摘要。请结合已有对话摘要、用户本轮文本和图片内容，输出一段给后续纯文本语言模型阅读的中文描述。要求：只客观描述图片中与当前对话可能相关的事实、文字、对象、场景、数据、关系和关键细节；不要回答用户的问题；不要编造看不见的细节；不要输出标题、前缀或解释。"
+  },
+  "summary_max_chars": {
+    "description": "图片摘要最大字符数",
     "type": "int",
-    "hint": "必须大于等于 1。插件会在这些后续请求的 system_prompt 中提醒模型回复前确认是否仍需多模态能力。",
+    "hint": "写入会话历史的隐藏图片摘要最大字符数，避免过多占用后续纯文本上下文。",
+    "default": 800
+  },
+  "summary_context_turns": {
+    "description": "传给总结模型的历史消息条数",
+    "type": "int",
+    "hint": "仅提取最近若干条纯文本历史消息（不含工具调用和历史图片）作为总结参考，设为 0 则仅传入本轮文本与图片。",
+    "default": 4
+  },
+  "route_quoted_images": {
+    "description": "路由引用消息中的图片",
+    "type": "bool",
+    "hint": "开启后，用户回复/引用包含图片的历史消息时也会触发多模态临时路由。",
+    "default": true
+  },
+  "confirm_turns": {
+    "description": "路由后追加确认提示的后续轮数",
+    "type": "int",
+    "hint": "在一次多模态临时路由完成后，为后续若干轮普通文本请求的 system_prompt 注入视觉确认提醒；设为 0 表示关闭。",
     "default": 3
   },
   "vision_provider_ids": {
-    "description": "已知具备多模态能力的 provider ID 白名单",
+    "description": "已知具备视觉能力的 provider ID 白名单",
     "type": "list",
-    "hint": "当 AstrBot provider 元数据没有明确能力字段时，用此列表兜底判断当前 provider 是否已支持图片。",
+    "hint": "当 AstrBot provider 未配置 modalities 能力字段时，用此列表兜底判定当前 provider 已支持图片，避免重复路由。",
     "default": []
   }
 }
