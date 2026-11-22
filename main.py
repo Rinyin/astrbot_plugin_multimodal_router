@@ -1,439 +1,312 @@
+"""AstrBot plugin entry point for temporary multimodal routing and image summary."""
+
 from __future__ import annotations
 
-import inspect
+import uuid
 from typing import Any
 
-import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
-
-PLUGIN_NAME = "astrbot_plugin_multimodal_router"
-
-CONFIRM_PROMPT = """
-你正在处于多模态路由确认窗口中。回复前请先在内部判断当前请求、
-最近上下文和可见图片是否仍需要视觉/多模态模型能力；如果当前模型
-不足以处理，请明确提醒需要切换到多模态模型。不要向用户暴露插件实现细节。
-""".strip()
-
-IMAGE_DESCRIPTION_SYSTEM_PROMPT = """
-你负责为对话上下文生成图片语义描述。请结合已有对话上下文、用户本轮文本
-和图片内容，输出一段给后续语言模型阅读的中文描述。要求：只描述图片中
-与当前对话可能相关的事实、文字、对象、场景、关系和关键信息；不要回答
-用户的问题；不要编造看不见的细节；不要输出标题或解释。
-""".strip()
-
-
-@register(
-    "multimodal_router",
-    "Rinyin",
-    "当图片请求遇到非多模态 LLM 时，临时路由到指定多模态 provider。",
-    "1.1.0",
+from .config import DEFAULT_CONFIRM_PROMPT, PLUGIN_NAME, RouterConfig
+from .media import backfill_image_urls_if_empty
+from .providers import format_providers_report
+from .routing import (
+    EXTRA_REQUEST_SNAPSHOT,
+    EXTRA_ROUTED,
+    EXTRA_SUMMARY_DONE,
+    EXTRA_SUMMARY_TASK_KEY,
+    EXTRA_TARGET_PROVIDER_ID,
+    ConfirmationTracker,
+    append_system_prompt,
+    apply_route_decision,
+    decide_route,
+    session_key,
 )
+from .summarizer import (
+    ImageSummarizer,
+    SummarySnapshot,
+    build_summary_snapshot,
+    inject_summary_into_legacy_contexts,
+    inject_summary_into_run_messages,
+)
+
+_HAS_WAITING_LLM_HOOK = hasattr(filter, "on_waiting_llm_request")
+_HAS_AGENT_LIFECYCLE_HOOKS = hasattr(filter, "on_agent_begin") and hasattr(
+    filter, "on_agent_done"
+)
+
+
+def _pre_llm_route_hook():
+    if _HAS_WAITING_LLM_HOOK:
+        return filter.on_waiting_llm_request(priority=100)
+    return filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+
+
+def _agent_begin_hook():
+    if _HAS_AGENT_LIFECYCLE_HOOKS:
+        return filter.on_agent_begin(priority=100)
+    return lambda fn: fn
+
+
+def _agent_done_hook():
+    if _HAS_AGENT_LIFECYCLE_HOOKS:
+        return filter.on_agent_done(priority=100)
+    return lambda fn: fn
+
+
+def _legacy_llm_response_hook():
+    if not _HAS_AGENT_LIFECYCLE_HOOKS:
+        return filter.on_llm_response(priority=100)
+    return lambda fn: fn
+
+
+def _is_successful_agent_response(run_context: Any, response: Any) -> bool:
+    if response is None or getattr(response, "role", None) != "assistant":
+        return False
+    end_reason = getattr(run_context, "run_end_reason", None)
+    return end_reason not in {"cancelled", "error"}
+
+
 class MultimodalRouterPlugin(Star):
+    """Route image requests to a multimodal provider and optionally summarize with a lighter model."""
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._confirm_remaining: dict[str, int] = {}
+        self._confirm_tracker = ConfirmationTracker()
+        self._summarizer = ImageSummarizer()
+
+    def _load_config(self) -> RouterConfig:
+        return RouterConfig.from_mapping(self.config)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("mmproviders")
     async def list_providers(self, event: AstrMessageEvent):
-        """列出当前加载的 LLM providers，便于配置 target_provider_id。"""
+        """列出当前加载的 LLM providers、视觉能力与多模态路由配置诊断。"""
         try:
-            providers = list(self.context.get_all_providers() or [])
-            using = self.context.get_using_provider()
-            using_id = self._provider_id(using)
-
-            if not providers:
-                yield event.plain_result("当前没有加载 LLM provider。")
-                return
-
-            lines = ["当前加载的 LLM providers:"]
-            for provider in providers:
-                provider_id = self._provider_id(provider)
-                name = self._provider_name(provider)
-                marker = " *当前使用*" if provider_id and provider_id == using_id else ""
-                lines.append(f"- id={provider_id or '<unknown>'}, name={name}{marker}")
-
-            target_id = self._target_provider_id()
-            if target_id:
-                lines.append(f"\n当前插件 target_provider_id: {target_id}")
-            else:
-                lines.append("\n当前插件 target_provider_id 未配置。")
-
-            yield event.plain_result("\n".join(lines))
-        except Exception as exc:
-            logger.error(f"{PLUGIN_NAME}: failed to list providers: {exc}", exc_info=True)
+            report = await format_providers_report(
+                self.context, event, self._load_config()
+            )
+            yield event.plain_result(report)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"{PLUGIN_NAME}: failed to list providers: {exc}", exc_info=True
+            )
             yield event.plain_result("列出 provider 失败，请查看 AstrBot 日志。")
 
-    @filter.on_llm_request(priority=100)
-    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """Decorate the final request after provider selection has happened."""
+    @_pre_llm_route_hook()
+    async def prepare_provider_selection(self, event: AstrMessageEvent) -> None:
+        """Select the multimodal answering provider before AstrBot builds the LLM request."""
         try:
-            self._apply_pending_confirmation(event, req)
-
-            if not self._message_has_image(event):
+            if not _HAS_WAITING_LLM_HOOK and not getattr(
+                event, "is_at_or_wake_command", True
+            ):
                 return
-            self._merge_image_urls(event, req)
-        except Exception as exc:
+            if event.get_extra(EXTRA_ROUTED):
+                return
+
+            config = self._load_config()
+            decision = await decide_route(self.context, event, config)
+            if not decision.should_route:
+                return
+
+            apply_route_decision(event, decision)
+            if decision.summary_provider_id:
+                logger.info(
+                    f"{PLUGIN_NAME}: routed image request to answer provider "
+                    f"{decision.target_provider_id!r} (summary provider="
+                    f"{decision.summary_provider_id!r})."
+                )
+            else:
+                logger.info(
+                    f"{PLUGIN_NAME}: routed image request to answer provider "
+                    f"{decision.target_provider_id!r} (image summary disabled)."
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"{PLUGIN_NAME}: prepare_provider_selection failed: {exc}",
+                exc_info=True,
+            )
+
+    @filter.on_llm_request(priority=100)
+    async def on_llm_request(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """Snapshot routed image inputs and inject follow-up confirmation prompts on text turns."""
+        try:
+            config = self._load_config()
+            if not config.enabled:
+                return
+
+            if event.get_extra(EXTRA_ROUTED):
+                backfill_image_urls_if_empty(
+                    event, req, include_quoted=config.route_quoted_images
+                )
+                if config.enable_image_summary:
+                    snapshot = build_summary_snapshot(req, config)
+                    if snapshot is not None:
+                        event.set_extra(EXTRA_REQUEST_SNAPSHOT, snapshot)
+                return
+
+            if self._confirm_tracker.consume(session_key(event)):
+                append_system_prompt(req, DEFAULT_CONFIRM_PROMPT)
+        except Exception as exc:  # noqa: BLE001
             logger.error(f"{PLUGIN_NAME}: on_llm_request failed: {exc}", exc_info=True)
 
-    @filter.on_llm_response(priority=100)
-    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        """Add a hidden image description to saved contexts after routed replies."""
+    @_agent_begin_hook()
+    async def on_agent_begin(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+    ) -> None:
+        """Optionally start image summarization in parallel when using a dedicated summary model."""
+        del run_context
         try:
-            if not self._should_describe_image(event, resp):
+            if not event.get_extra(EXTRA_ROUTED):
+                return
+            config = self._load_config()
+            if not config.should_run_summary_in_parallel:
+                return
+
+            snapshot = event.get_extra(EXTRA_REQUEST_SNAPSHOT)
+            if not isinstance(snapshot, SummarySnapshot):
+                return
+
+            routed_target_id = str(event.get_extra(EXTRA_TARGET_PROVIDER_ID) or "")
+            task_key = uuid.uuid4().hex
+            self._summarizer.start_background_summary(
+                task_key,
+                context=self.context,
+                snapshot=snapshot,
+                config=config,
+                routed_target_id=routed_target_id,
+            )
+            event.set_extra(EXTRA_SUMMARY_TASK_KEY, task_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"{PLUGIN_NAME}: on_agent_begin failed: {exc}", exc_info=True)
+
+    @_agent_done_hook()
+    async def on_agent_done(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+        response: LLMResponse | None,
+    ) -> None:
+        """Persist the hidden image summary into run_context.messages and arm confirmation turns."""
+        try:
+            if not event.get_extra(EXTRA_ROUTED):
+                return
+            if event.get_extra(EXTRA_SUMMARY_DONE):
+                return
+
+            task_key = event.get_extra(EXTRA_SUMMARY_TASK_KEY)
+            if not _is_successful_agent_response(run_context, response):
+                self._summarizer.cancel_task(task_key)
+                return
+
+            event.set_extra(EXTRA_SUMMARY_DONE, True)
+            config = self._load_config()
+            self._confirm_tracker.arm(session_key(event), config.confirm_turns)
+
+            if not config.enable_image_summary:
+                self._summarizer.cancel_task(task_key)
+                return
+
+            snapshot = self._resolve_snapshot(event, config)
+            if snapshot is None:
+                self._summarizer.cancel_task(task_key)
+                return
+
+            routed_target_id = str(event.get_extra(EXTRA_TARGET_PROVIDER_ID) or "")
+            summary = await self._summarizer.await_or_generate(
+                task_key,
+                context=self.context,
+                snapshot=snapshot,
+                config=config,
+                routed_target_id=routed_target_id,
+            )
+            if not summary:
+                return
+
+            messages = getattr(run_context, "messages", None)
+            if isinstance(messages, list) and inject_summary_into_run_messages(
+                messages, summary
+            ):
+                logger.info(
+                    f"{PLUGIN_NAME}: injected hidden image summary into run_context.messages."
+                )
                 return
 
             req = event.get_extra("provider_request")
-            if not isinstance(req, ProviderRequest) or not req.image_urls:
-                return
-
-            target_id = str(event.get_extra("mm_router_target_provider_id") or "")
-            provider = self.context.get_provider_by_id(target_id) if target_id else None
-            if provider is None:
-                logger.warning(
-                    f"{PLUGIN_NAME}: routed provider {target_id!r} not found; "
-                    "skip image context description."
+            if inject_summary_into_legacy_contexts(req, summary):
+                logger.info(
+                    f"{PLUGIN_NAME}: injected hidden image summary into legacy req.contexts."
                 )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"{PLUGIN_NAME}: on_agent_done failed: {exc}", exc_info=True)
+
+    @_legacy_llm_response_hook()
+    async def on_llm_response(
+        self,
+        event: AstrMessageEvent,
+        resp: LLMResponse,
+    ) -> None:
+        """Legacy AstrBot (< 4.x) fallback when on_agent_done is unavailable."""
+        try:
+            if not event.get_extra(EXTRA_ROUTED):
+                return
+            if event.get_extra(EXTRA_SUMMARY_DONE):
+                return
+            if resp is None or getattr(resp, "role", None) != "assistant":
                 return
 
-            description = await self._describe_images(provider, req)
-            if not description:
+            event.set_extra(EXTRA_SUMMARY_DONE, True)
+            config = self._load_config()
+            self._confirm_tracker.arm(session_key(event), config.confirm_turns)
+
+            if not config.enable_image_summary:
                 return
 
-            req.contexts.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "[由多模态模型生成的图片上下文描述，供后续对话参考]\n"
-                        f"{description}"
-                    ),
-                }
+            snapshot = self._resolve_snapshot(event, config)
+            if snapshot is None:
+                return
+
+            routed_target_id = str(event.get_extra(EXTRA_TARGET_PROVIDER_ID) or "")
+            summary = await self._summarizer.generate_summary(
+                self.context,
+                snapshot,
+                config,
+                routed_target_id,
             )
-            event.set_extra("mm_router_description_done", True)
-            logger.info(f"{PLUGIN_NAME}: added routed image description to contexts.")
-        except Exception as exc:
+            if not summary:
+                return
+
+            req = event.get_extra("provider_request")
+            if inject_summary_into_legacy_contexts(req, summary):
+                logger.info(
+                    f"{PLUGIN_NAME}: injected hidden image summary into req.contexts."
+                )
+        except Exception as exc:  # noqa: BLE001
             logger.error(f"{PLUGIN_NAME}: on_llm_response failed: {exc}", exc_info=True)
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
-    async def prepare_provider_selection(self, event: AstrMessageEvent):
-        """Select the multimodal provider before AstrBot builds the LLM request."""
-        try:
-            if not self._message_has_image(event):
-                return
-
-            current_provider = self._current_provider(event)
-            if current_provider is None:
-                logger.warning(f"{PLUGIN_NAME}: no active LLM provider; skip routing.")
-                return
-
-            target_id = self._target_provider_id()
-            current_id = self._provider_id(current_provider)
-            if target_id and current_id == target_id:
-                return
-
-            if self._provider_supports_vision(current_provider):
-                return
-
-            if not target_id:
-                logger.warning(f"{PLUGIN_NAME}: target_provider_id is empty; skip routing.")
-                return
-
-            target_provider = self.context.get_provider_by_id(target_id)
-            if target_provider is None:
-                logger.error(
-                    f"{PLUGIN_NAME}: target provider {target_id!r} was not found. "
-                    "Use /mmproviders to inspect loaded provider ids."
-                )
-                return
-
-            event.set_extra("selected_provider", target_id)
-            event.set_extra("mm_router_routed", True)
-            event.set_extra("mm_router_target_provider_id", target_id)
-            self._confirm_remaining[self._session_key(event)] = self._confirm_turns()
-            logger.info(
-                f"{PLUGIN_NAME}: selected provider {target_id!r} for one image request."
-            )
-        except Exception as exc:
-            logger.error(
-                f"{PLUGIN_NAME}: prepare_provider_selection failed: {exc}", exc_info=True
-            )
-
-    def _target_provider_id(self) -> str:
-        return str(self.config.get("target_provider_id", "") or "").strip()
-
-    def _confirm_turns(self) -> int:
-        raw_value = self.config.get("confirm_turns", 3)
-        try:
-            value = int(raw_value)
-        except (TypeError, ValueError):
-            logger.warning(
-                f"{PLUGIN_NAME}: invalid confirm_turns={raw_value!r}; use default 3."
-            )
-            return 3
-        if value < 1:
-            logger.warning(f"{PLUGIN_NAME}: confirm_turns must be >= 1; use default 3.")
-            return 3
-        return value
-
-    def _vision_provider_ids(self) -> set[str]:
-        raw_value = self.config.get("vision_provider_ids", [])
-        if isinstance(raw_value, str):
-            return {item.strip() for item in raw_value.split(",") if item.strip()}
-        if isinstance(raw_value, list):
-            return {str(item).strip() for item in raw_value if str(item).strip()}
-        return set()
-
-    def _should_describe_image(
-        self, event: AstrMessageEvent, resp: LLMResponse
-    ) -> bool:
-        return bool(
-            event.get_extra("mm_router_routed")
-            and not event.get_extra("mm_router_description_done")
-            and resp
-            and resp.role == "assistant"
-            and self._message_has_image(event)
-        )
-
-    async def _describe_images(self, provider: Any, req: ProviderRequest) -> str:
-        user_text = req.prompt.strip() if req.prompt else "[图片]"
-        prompt = (
-            "请为本轮用户图片生成一段上下文描述。\n\n"
-            f"用户本轮文本：{user_text}\n\n"
-            "输出限制：120-300 字；只输出描述正文。"
-        )
-        response = await self._call_compat(
-            provider.text_chat,
-            {
-                "prompt": prompt,
-                "session_id": req.session_id,
-                "image_urls": list(req.image_urls or []),
-                "contexts": list(req.contexts or []),
-                "system_prompt": IMAGE_DESCRIPTION_SYSTEM_PROMPT,
-                "model": getattr(req, "model", None),
-            },
-        )
-        description = str(getattr(response, "completion_text", "") or "").strip()
-        return description[:1200]
-
-    async def _call_compat(self, func: Any, kwargs: dict[str, Any]) -> Any:
-        signature = inspect.signature(func)
-        accepts_kwargs = any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
-        )
-        if accepts_kwargs:
-            result = func(**kwargs)
-        else:
-            supported = {
-                key: value for key, value in kwargs.items() if key in signature.parameters
-            }
-            result = func(**supported)
-        if inspect.isawaitable(result):
-            return await result
-        return result
-
-    def _message_has_image(self, event: AstrMessageEvent) -> bool:
-        message_obj = getattr(event, "message_obj", None)
-        segments = getattr(message_obj, "message", None) or []
-        return any(self._is_image_segment(segment) for segment in segments)
-
-    def _is_image_segment(self, segment: Any) -> bool:
-        return isinstance(segment, Comp.Image) or segment.__class__.__name__ == "Image"
-
-    def _merge_image_urls(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
-        if not hasattr(req, "image_urls"):
-            return
-
-        image_urls = list(getattr(req, "image_urls", None) or [])
-        seen = {str(item) for item in image_urls}
-
-        message_obj = getattr(event, "message_obj", None)
-        segments = getattr(message_obj, "message", None) or []
-        for segment in segments:
-            if not self._is_image_segment(segment):
-                continue
-            for attr in ("url", "file", "path"):
-                value = getattr(segment, attr, None)
-                if value and str(value) not in seen:
-                    image_urls.append(value)
-                    seen.add(str(value))
-                    break
-
-        setattr(req, "image_urls", image_urls)
-
-    def _provider_supports_vision(self, provider: Any) -> bool:
-        provider_id = self._provider_id(provider)
-        if provider_id and provider_id in self._vision_provider_ids():
-            return True
-
-        modalities = self._provider_modalities(provider)
-        if isinstance(modalities, list):
-            return "image" in modalities
-
-        for value in self._provider_capability_values(provider):
-            if isinstance(value, bool) and value:
-                return True
-            if isinstance(value, str) and self._capability_text_mentions_vision(value):
-                return True
-            if isinstance(value, (list, tuple, set)) and any(
-                self._capability_text_mentions_vision(str(item)) for item in value
-            ):
-                return True
-            if isinstance(value, dict) and self._capability_dict_supports_vision(value):
-                return True
-
-        return False
-
-    def _provider_modalities(self, provider: Any) -> Any:
-        provider_config = getattr(provider, "provider_config", None)
-        if isinstance(provider_config, dict):
-            return provider_config.get("modalities", None)
+    def _resolve_snapshot(
+        self,
+        event: AstrMessageEvent,
+        config: RouterConfig,
+    ) -> SummarySnapshot | None:
+        snapshot = event.get_extra(EXTRA_REQUEST_SNAPSHOT)
+        if isinstance(snapshot, SummarySnapshot):
+            return snapshot
+        req = event.get_extra("provider_request")
+        if req is not None:
+            return build_summary_snapshot(req, config)
         return None
 
-    def _provider_capability_values(self, provider: Any) -> list[Any]:
-        values: list[Any] = []
-        for attr in (
-            "supports_multimodal",
-            "support_multimodal",
-            "is_multimodal",
-            "supports_vision",
-            "support_vision",
-            "supports_image",
-            "support_image",
-            "modalities",
-            "capabilities",
-            "model_capabilities",
-            "metadata",
-            "meta",
-        ):
-            if hasattr(provider, attr):
-                value = getattr(provider, attr)
-                values.append(value() if callable(value) else value)
-
-        for container_attr in ("config", "model_config"):
-            container = getattr(provider, container_attr, None)
-            if isinstance(container, dict):
-                for key in (
-                    "supports_multimodal",
-                    "supports_vision",
-                    "supports_image",
-                    "modalities",
-                    "capabilities",
-                ):
-                    if key in container:
-                        values.append(container[key])
-        return values
-
-    def _capability_dict_supports_vision(self, value: dict[Any, Any]) -> bool:
-        for key, item in value.items():
-            key_text = str(key).lower()
-            if any(token in key_text for token in ("vision", "image", "multimodal")):
-                if item is True:
-                    return True
-                if isinstance(item, str) and item.lower() not in ("false", "0", "no"):
-                    return True
-                if isinstance(item, (list, tuple, set, dict)) and bool(item):
-                    return True
-            if self._capability_text_mentions_vision(str(item)):
-                return True
-        return False
-
-    def _capability_text_mentions_vision(self, value: str) -> bool:
-        text = value.lower()
-        return any(
-            token in text
-            for token in ("vision", "image", "multimodal", "multi-modal", "vl")
-        )
-
-    def _apply_pending_confirmation(
-        self, event: AstrMessageEvent, req: ProviderRequest
-    ) -> None:
-        key = self._session_key(event)
-        remaining = self._confirm_remaining.get(key, 0)
-        if remaining <= 0:
-            self._confirm_remaining.pop(key, None)
-            return
-
-        self._append_system_prompt(req, CONFIRM_PROMPT)
-        remaining -= 1
-        if remaining > 0:
-            self._confirm_remaining[key] = remaining
-        else:
-            self._confirm_remaining.pop(key, None)
-
-    def _append_system_prompt(self, req: ProviderRequest, prompt: str) -> None:
-        if not hasattr(req, "system_prompt"):
-            logger.warning(f"{PLUGIN_NAME}: ProviderRequest has no system_prompt field.")
-            return
-        current = getattr(req, "system_prompt", "") or ""
-        if prompt in current:
-            return
-        separator = "\n\n" if current else ""
-        setattr(req, "system_prompt", f"{current}{separator}{prompt}")
-
-    def _session_key(self, event: AstrMessageEvent) -> str:
-        return str(
-            getattr(event, "unified_msg_origin", None)
-            or getattr(getattr(event, "message_obj", None), "session_id", None)
-            or getattr(event, "session_id", None)
-            or "default"
-        )
-
-    def _provider_id(self, provider: Any) -> str:
-        if provider is None:
-            return ""
-        for attr in ("id", "provider_id", "provider_name", "name"):
-            value = getattr(provider, attr, None)
-            if value:
-                return str(value)
-
-        metadata = getattr(provider, "metadata", None) or getattr(provider, "meta", None)
-        if callable(metadata):
-            try:
-                metadata = metadata()
-            except Exception as exc:
-                logger.debug(f"{PLUGIN_NAME}: provider meta() failed: {exc}")
-        if isinstance(metadata, dict):
-            for key in ("id", "provider_id", "name"):
-                value = metadata.get(key)
-                if value:
-                    return str(value)
-        for attr in ("id", "provider_id", "name"):
-            value = getattr(metadata, attr, None)
-            if value:
-                return str(value)
-
-        return ""
-
-    def _current_provider(self, event: AstrMessageEvent) -> Any:
-        selected_provider = None
-        if hasattr(event, "get_extra"):
-            selected_provider = event.get_extra("selected_provider")
-        if selected_provider:
-            provider = self.context.get_provider_by_id(str(selected_provider))
-            if provider is not None:
-                return provider
-
-        try:
-            return self.context.get_using_provider(
-                umo=getattr(event, "unified_msg_origin", None)
-            )
-        except TypeError:
-            return self.context.get_using_provider()
-
-    def _provider_name(self, provider: Any) -> str:
-        if provider is None:
-            return "<none>"
-        for attr in ("display_name", "name", "provider_name", "model"):
-            value = getattr(provider, attr, None)
-            if value:
-                return str(value)
-        return provider.__class__.__name__
-
-    async def terminate(self):
-        self._confirm_remaining.clear()
+    async def terminate(self) -> None:
+        await self._summarizer.cancel_all()
+        self._confirm_tracker.clear()
